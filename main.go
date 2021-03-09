@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	endpoint = "http://app-homevision-staging.herokuapp.com/api_project/houses?page=%d"
-	maxTries = 20
+	endpoint      = "http://app-homevision-staging.herokuapp.com/api_project/houses?page=%d"
+	maxTries      = 20
+	maxGoroutines = 20
 )
 
 var (
@@ -35,41 +36,97 @@ type house struct {
 	PhotoURL  string `json:"photoURL"`
 }
 
+// how this works is we use a pipeline so that both the fetch and downloads can be performed concurrently
+// this increased runtime by an estimate ~12s
 func main() {
 	// use a client of timeout of 30 seconds for all requests to avoid hang
 	client = http.Client{
 		Timeout: time.Second * 30,
 	}
 
-	// don't need to use url.URL for now since it's a const endpoint we are pinging
-	allHouses := make([]house, 0)
-	for i := 1; i <= 10; i++ {
-		pageEndpoint := fmt.Sprintf(endpoint, i)
-		resp, err := requestWithRetry(pageEndpoint)
-		if err != nil {
-			log.Fatalf("error requesting %s: %v", pageEndpoint, err)
-		}
-		defer resp.Body.Close()
+	housesPipeline := pipeHouses()
 
-		// decode the response and append to the array of all houses
-		var houses houses
-		if err := json.NewDecoder(resp.Body).Decode(&houses); err != nil {
-			log.Fatalf("error decoding json response: %v", err)
-		}
-		allHouses = append(allHouses, houses.Houses...)
-	}
-	fmt.Printf("there is a total of %d houses", len(allHouses))
-
-	start := time.Now()
-	// begin downloads
-	for _, house := range allHouses {
-		go downloadHouseImage(house)
+	// dispatch a set of goroutines to listen to and download images.
+	// maxGoroutines can be tweaked for scalability and downloading in the thousands.
+	// for now, a lower number is fine to avoid delay from creating and releasing the goroutines
+	for i := 0; i < maxGoroutines; i++ {
 		wg.Add(1)
+		go downloadHouseImages(housesPipeline)
 	}
-
 	wg.Wait()
-	fmt.Printf("\nit took %s to complete\n", time.Now().Sub(start).String())
+	//	fmt.Printf("\nAll Image download took %s to complete\n", time.Now().Sub(start).String())
+}
 
+// pipeHouse returns a channel of houses, and dispatches a goroutine that loads each page
+// then send the responses to the channel
+func pipeHouses() <-chan house {
+	out := make(chan house)
+	go func() {
+		for i := 1; i <= 10; i++ {
+			pageEndpoint := fmt.Sprintf(endpoint, i)
+			resp, err := requestWithRetry(pageEndpoint)
+			if err != nil {
+				log.Fatalf("error requesting %s: %v", pageEndpoint, err)
+			}
+			defer resp.Body.Close()
+
+			var houses houses
+			if err := json.NewDecoder(resp.Body).Decode(&houses); err != nil {
+				log.Fatalf("error decoding json response: %v", err)
+			}
+
+			for _, house := range houses.Houses {
+				out <- house
+			}
+		}
+		close(out)
+
+	}()
+
+	return out
+}
+
+// downloadHouseImages downloads the image attached to the file
+// it downloads it by copying directly from the response body reader,
+// to avoid reading the file contents to memory first.
+// It downloads by using an infinite loop to listen in on the input channel and get to work
+// once the input channel is closed, the loop is broken out of and the wait group is released
+func downloadHouseImages(in <-chan house) {
+	for {
+		if house, ok := <-in; ok {
+			fileName := fmt.Sprintf(
+				"id-%d-%s.%s",
+				house.ID,
+				strings.TrimRight(house.Address, "."),
+				filepath.Ext(house.PhotoURL),
+			)
+
+			logger := log.New(os.Stdout, "\n"+fileName, log.Ltime)
+			resp, err := client.Get(house.PhotoURL)
+			if err != nil {
+				logger.Printf("error getting photo: %v", err)
+				return
+			}
+			defer resp.Body.Close()
+
+			// create the file
+			file, err := os.Create(fileName)
+			if err != nil {
+				logger.Printf("could not create file: %v", err)
+				return
+			}
+			defer file.Close()
+
+			// copy the contents
+			if _, err := io.Copy(file, resp.Body); err != nil {
+				logger.Printf("error copying file contents: %v", err)
+				return
+			}
+		} else {
+			break
+		}
+	}
+	wg.Done()
 }
 
 func requestWithRetry(url string) (*http.Response, error) {
@@ -95,40 +152,4 @@ func requestWithRetry(url string) (*http.Response, error) {
 		tries++
 	}
 	return resp, err
-}
-
-// downloadHouseImage downloads the image attached to the file
-// it downloads it by copying directly from the response body reader,
-// to avoid reading the file contents to memory first
-func downloadHouseImage(house house) {
-	defer wg.Done()
-	fileName := fmt.Sprintf(
-		"id-%d-%s.%s",
-		house.ID,
-		strings.TrimRight(house.Address, "."),
-		filepath.Ext(house.PhotoURL),
-	)
-
-	logger := log.New(os.Stdout, "\n"+fileName, log.Ltime)
-	resp, err := client.Get(house.PhotoURL)
-	if err != nil {
-		logger.Printf("error getting photo: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// create the file
-	file, err := os.Create(fileName)
-	if err != nil {
-		logger.Printf("could not create file: %v", err)
-		return
-	}
-	defer file.Close()
-
-	// copy the contents
-	if _, err := io.Copy(file, resp.Body); err != nil {
-		logger.Printf("error copying file contents: %v", err)
-		return
-	}
-
 }
